@@ -6,10 +6,7 @@ import torch.optim as optim
 import random, time, datetime, os, itertools
 import numpy as np
 # import matplotlib.pyplot as plt
-
-from pathlib import Path
 from collections import namedtuple, deque
-from PIL import Image
 
 import gym
 from gym.spaces import Box
