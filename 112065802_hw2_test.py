@@ -5,7 +5,7 @@ import torch.optim as optim
 
 import random, time, datetime, os, itertools
 import numpy as np
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
 from pathlib import Path
 from collections import namedtuple, deque
@@ -136,8 +136,8 @@ for t in range(tmax):
         break
 
 print('Sum of rewards is ', sum(rs))
-plt.plot(rs)
-plt.show()
+# plt.plot(rs)
+# plt.show()
 
-plt.plot(xs)
-plt.show()
+# plt.plot(xs)
+# plt.show()
