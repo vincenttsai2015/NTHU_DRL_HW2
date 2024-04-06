@@ -2,7 +2,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import transforms as T
 
 import random, time, datetime, os, itertools
 import numpy as np
