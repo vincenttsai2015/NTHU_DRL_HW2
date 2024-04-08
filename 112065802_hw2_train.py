@@ -266,7 +266,7 @@ def preprocess(frame):
     return frame
 
 # Training
-episode = 100
+episode = 10000
 discount_rate = .99
 noise = 0.05
 noise_decay = 0.99
@@ -281,27 +281,28 @@ MAX_FRAMES = 4
 nn_frames = deque(maxlen=MAX_FRAMES)
 for i in range(MAX_FRAMES):
     nn_frames.append(np.zeros(FRAME_SHAPE))
-    
-ACTION_SIZE = 7 #len(valid_actions)
+
+ACTION_SIZE = 12 #len(valid_actions)
 STATE_SIZE = (MAX_FRAMES,) + FRAME_SHAPE
+print(f'Size of states: {STATE_SIZE}')
 agent = Agent()
 
 for e in range(episode):
     obs = env.reset()
-    prev_obs = None
+    # print(f'Size of currently observed state: {obs.shape}')
     sum_reward = 0
     
     for i in range(MAX_FRAMES):
         nn_frames.append(np.zeros(FRAME_SHAPE))
+    # print(f'Size of preprocessed observed state: {preprocess(obs).shape}')
     nn_frames.append(np.copy(preprocess(obs)))
     states = np.array(nn_frames)
+    # print(f'Size of frame states: {states.shape}')
     for t in range(tmax):
-        # prev_obs = np.copy(obs)
         actions = agent.act(states)
         obs, reward, done, _ = env.step(actions)
         nn_frames.append(np.copy(preprocess(obs)))
         next_states = np.array(nn_frames)
-        # next_states = model_preprocess(obs, prev_obs)
         
         agent.step(states, int(actions), int(reward), next_states, int(done))
         sum_reward += reward

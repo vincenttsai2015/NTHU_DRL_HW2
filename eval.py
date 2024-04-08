@@ -11,8 +11,6 @@ from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 env = gym_super_mario_bros.make('SuperMarioBros-v0')
 env = JoypadSpace(env, COMPLEX_MOVEMENT)
 
-
-
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Mario")
 
