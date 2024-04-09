@@ -1,171 +1,202 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
-import torch.optim as optim
+from torchvision import transforms as T
 
-import random, time, datetime, os, itertools
 import numpy as np
-import time
-from tqdm import tqdm
-# import matplotlib.pyplot as plt
-from collections import namedtuple, deque
+import random, time, datetime, os
+import cv2
+from pathlib import Path
+from collections import deque
 
+# Gym is an OpenAI toolkit for RL
 import gym
 from gym.spaces import Box
 from gym.wrappers import FrameStack
 
+# NES Emulator for OpenAI Gym
 from nes_py.wrappers import JoypadSpace
+
+# Super Mario environment for OpenAI Gym
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
-env = gym_super_mario_bros.make('SuperMarioBros-v0')
-env = JoypadSpace(env, COMPLEX_MOVEMENT)
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# Environment preprocessing
+class SkipFrame(gym.Wrapper):
+    def __init__(self, env, skip):
+        """Return only every `skip`-th frame"""
+        super().__init__(env)
+        self._skip = skip
 
-def preprocess(frame):
-    frame = frame.sum(axis=-1)/765
-    frame = frame[20:210,:]
-    frame = frame[::2,::2]
-    return frame
+    def step(self, action):
+        """Repeat action, and sum reward"""
+        total_reward = 0.0
+        for i in range(self._skip):
+            # Accumulate reward and repeat the same action
+            obs, reward, done, info = self.env.step(action)
+            total_reward += reward
+            if done:
+                break
+        return obs, total_reward, done, info
 
-class DuelingDQN(nn.Module):
-    """Actor (Policy) Model."""
+class GrayScaleObservation(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        obs_shape = self.observation_space.shape[:2]
+        self.observation_space = Box(low=0, high=255, shape=obs_shape, dtype=np.uint8)
 
-    def __init__(self, channels, action_size, seed=42):
-        """Initialize parameters and build model.
-        Params
-        ======
-            state_size (int): Dimension of each state
-            action_size (int): Dimension of each action
-            seed (int): Random seed
-        """
-        super(DuelingDQN, self).__init__()
-        self.seed = torch.manual_seed(seed)
-        self.conv1 = nn.Conv2d(channels, 4, 3, padding=1)
-        self.conv2 = nn.Conv2d(4, 8, 3, padding=1)
-        self.conv3 = nn.Conv2d(8, 16, 3, padding=1)
-        self.conv4 = nn.Conv2d(16, 16, 3, padding=1)
-        self.conv5 = nn.Conv2d(16, 16, 3, padding=1)
-        
-        self.pool = nn.MaxPool2d(2, ceil_mode=True)
-        
-        flat_len = 16*3*4
-        self.fcval = nn.Linear(flat_len, 20)
-        self.fcval2 = nn.Linear(20, 1)
-        self.fcadv = nn.Linear(flat_len, 20)
-        self.fcadv2 = nn.Linear(20, action_size)
+    def permute_orientation(self, observation):
+        # permute [H, W, C] array to [C, H, W] tensor
+        observation = np.transpose(observation, (2, 0, 1))
+        observation = torch.tensor(observation.copy(), dtype=torch.float)
+        return observation
 
-    def forward(self, x):
-        """Build a network that maps state -> action values."""
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = self.pool(F.relu(self.conv3(x)))
-        x = self.pool(F.relu(self.conv4(x)))
-        x = self.pool(F.relu(self.conv5(x)))
+    def observation(self, observation):
+        observation = self.permute_orientation(observation)
+        transform = T.Grayscale()
+        observation = transform(observation)
+        return observation
 
-        x = x.reshape(x.shape[0], -1)
-        
-        advantage = F.relu(self.fcadv(x))
-        advantage = self.fcadv2(advantage)
-        advantage = advantage - torch.mean(advantage, dim=-1, keepdim=True)
-        
-        value = F.relu(self.fcval(x))
-        value = self.fcval2(value)
+class ResizeObservation(gym.ObservationWrapper):
+    def __init__(self, env, shape):
+        super().__init__(env)
+        if isinstance(shape, int):
+            self.shape = (shape, shape)
+        else:
+            self.shape = tuple(shape)
 
-        return value + advantage
+        obs_shape = self.shape + self.observation_space.shape[2:]
+        self.observation_space = Box(low=0, high=255, shape=obs_shape, dtype=np.uint8)
 
+    def observation(self, observation):
+        transforms = T.Compose([T.Resize(self.shape, antialias=True), T.Normalize(0, 255)])
+        observation = transforms(observation).squeeze(0)
+        return observation
+
+# DQN Architecture
+class D2QN(nn.Module):
+    """mini CNN structure: input -> (conv2d + relu) x 3 -> flatten -> (dense + relu) x 2 -> output"""
+
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        c, h, w = input_dim
+
+        if h != 84:
+            raise ValueError(f"Expecting input height: 84, got: {h}")
+        if w != 84:
+            raise ValueError(f"Expecting input width: 84, got: {w}")
+
+        self.online = self.__build_cnn(c, output_dim)
+
+        self.target = self.__build_cnn(c, output_dim)
+        self.target.load_state_dict(self.online.state_dict())
+
+        # Q_target parameters are frozen.
+        for p in self.target.parameters():
+            p.requires_grad = False
+
+    def forward(self, input, model):
+        if model == "online":
+            return self.online(input)
+        elif model == "target":
+            return self.target(input)
+
+    def __build_cnn(self, c, output_dim):
+        return nn.Sequential(
+            nn.Conv2d(in_channels=c, out_channels=32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(3136, 512),
+            nn.ReLU(),
+            nn.Linear(512, output_dim),
+        )
+
+# Agent
 class Agent:
-    """Agent that acts randomly."""
     def __init__(self):
-        self.action_space = gym.spaces.Discrete(12)
-        self.model = DuelingDQN(4, 12, 30)
-        self.model.load_state_dict(torch.load("112065802_hw2_data"), strict=False)
-        # self.model = torch.load('112065802_hw2_data')
+        # self.use_cuda = torch.cuda.is_available()
+        # Mario's DNN to predict the most optimal action - we implement this in the Learn section
+        self.net = D2QN((4, 84, 84), 12).float()
+        self.load('112065802_hw2_data')
+        # self.net.load_state_dict(torch.load('112065802_hw2_data'), strict=False)
+        self.frames = deque(maxlen=4)
+        self.curr_step = 0
+        self.memory = deque(maxlen=100000)
 
     def act(self, observation):
-        nn_frames = deque(maxlen=MAX_FRAMES)
-        for i in range(MAX_FRAMES):
-            nn_frames.append(np.zeros(FRAME_SHAPE))
-        # print(f'Size of preprocessed observed state: {preprocess(observation).shape}')
-        nn_frames.append(np.copy(preprocess(observation)))
-        states = np.array(nn_frames)
+        preprocess_obs = cv2.cvtColor(observation, cv2.COLOR_RGB2GRAY)
+        preprocess_obs = cv2.resize(preprocess_obs, (84, 84), interpolation=cv2.INTER_AREA)
+        while len(self.frames) < 3:
+            self.frames.append(preprocess_obs)
+        self.frames.append(preprocess_obs)
+        preprocess_obs = torch.from_numpy(np.array(self.frames) / 255).float().unsqueeze(0)
+        # observation = observation[0].__array__() if isinstance(observation, tuple) else observation.__array__()
+        # observation = torch.from_numpy(observation.copy()).unsqueeze(0)
+        # print(f'shape of observation: {observation.shape}')
+        action_values = self.net(preprocess_obs, model="online")
+        action_idx = torch.argmax(action_values, axis=1).item()
         
-        observations = torch.from_numpy(np.copy(states)).float().unsqueeze(0).to(device)
-        with torch.no_grad():
-            action_values = self.model(observations)
+        # increment step
+        self.curr_step += 1
+        
+        return action_idx
 
-        # Epsilon-greedy action selection
-        if random.random() > 0:
-            return np.argmax(action_values.cpu().data.numpy())
-        else:
-            return random.choice(np.arange(self.action_size))
+    def cache(self, state, next_state, action, reward, done):
+        """Add the experience to memory"""
+        def first_if_tuple(x):
+            return x[0] if isinstance(x, tuple) else x
+        state = first_if_tuple(state).__array__()
+        next_state = first_if_tuple(next_state).__array__()
 
-# keep track of frames
-FRAME_SHAPE = (95, 128)
-MAX_FRAMES = 4
-nn_frames = deque(maxlen=MAX_FRAMES)
+        state = torch.FloatTensor(state)
+        next_state = torch.FloatTensor(next_state)
+        action = torch.LongTensor([action])
+        reward = torch.DoubleTensor([reward])
+        done = torch.BoolTensor([done])
+
+        self.memory.append((state, next_state, action, reward, done))
     
-# ACTION_SIZE = 12 #len(valid_actions)
-# STATE_SIZE = (MAX_FRAMES,) + FRAME_SHAPE
+    def load(self, load_path):
+        ckp = torch.load(load_path)
+        exploration_rate = ckp.get('exploration_rate')
+        state_dict = ckp.get('model')
 
-agent = Agent()
-tmax = 500
-rs = []
-xs = []
-ys = []
-frames = np.zeros((tmax, 240, 256, 3), dtype=np.uint8)
+        print(f"Loading model at {load_path} with exploration rate {exploration_rate}")
+        self.net.load_state_dict(state_dict)
+        self.exploration_rate = exploration_rate
 
-for e in range(50):
-    obs = env.reset()
-    sum_reward = 0
-    for t in range(tmax):
-        frames[t] = obs
-        actions = agent.act(frames[t])
-        obs, reward, done, info = env.step(actions)
-        nn_frames.append(np.copy(preprocess(obs)))
-        next_states = np.array(nn_frames)
 
-        sum_reward += reward
-        states = next_states
-        rs.append(reward)
-        xs.append(info['x_pos'])
-        ys.append(info['y_pos'])
-        if done:
-            break
+if __name__=='__main__':
+    env = gym_super_mario_bros.make('SuperMarioBros-v0')
+    env = JoypadSpace(env, COMPLEX_MOVEMENT)
 
-print('Sum of rewards is ', sum(rs))
-# plt.plot(rs)
-# plt.show()
+    env.reset()
+    mario = Agent()
 
-# plt.plot(xs)
-# plt.show()
+    total_reward = 0
+    episodes = 50
 
-# total_reward = 0
-# total_time = 0
-# time_limit = 120
-# for episode in tqdm(range(50), desc="Evaluating"):
-    # obs = env.reset()
-    # print(f'Size of currently observed state: {obs.shape}')
-    # start_time = time.time()
-    # episode_reward = 0
-    
-    # while True:
-        # action = agent.act(obs)
-        # obs, reward, done, info = env.step(action)
-        # episode_reward += reward
+    for e in range(episodes):
+        state = env.reset()
+        episode_reward = 0
+        print(f'Episode {e}')
+        while True:
+            # env.render()
+            action = mario.act(state)
+            next_state, reward, done, info = env.step(action)
+            mario.cache(state, next_state, action, reward, done)
+            episode_reward += reward
+            
+            state = next_state
 
-        # if time.time() - start_time > time_limit:
-            # print(f"Time limit reached for episode {episode}")
-            # break
+            if done or info['flag_get']:
+                break
+        
+        print(f'Episode reward in episode {e}: {episode_reward}')
+        total_reward += episode_reward
 
-        # if done:
-            # break
-
-    # end_time = time.time()
-    # total_reward += episode_reward
-    # total_time += (end_time - start_time)
-
-# env.close()
-
-# score = total_reward / 50
-# print(f"Final Score: {score}")
+    avg_reward = total_reward/50
+    print(f'Average reward: {avg_reward}')
