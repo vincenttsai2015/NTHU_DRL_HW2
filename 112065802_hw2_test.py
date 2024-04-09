@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torchvision import transforms as T
 
 import numpy as np
 import random, time, datetime, os
@@ -98,8 +99,8 @@ class Agent:
         state = first_if_tuple(state).__array__()
         next_state = first_if_tuple(next_state).__array__()
 
-        state = torch.FloatTensor(state)
-        next_state = torch.FloatTensor(next_state)
+        state = torch.FloatTensor(state.copy())
+        next_state = torch.FloatTensor(next_state.copy())
         action = torch.LongTensor([action])
         reward = torch.DoubleTensor([reward])
         done = torch.BoolTensor([done])
