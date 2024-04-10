@@ -30,32 +30,34 @@ class D3QN(nn.Module):
         if w != 84:
             raise ValueError(f"Expecting input width: 84, got: {w}")
         
-        self.conv1 = nn.ReLU(nn.Conv2d(c, 32, kernel_size=8, stride=4))
-        self.conv2 = nn.ReLU(nn.Conv2d(32, 64, kernel_size=4, stride=2))
-        self.conv3 = nn.ReLU(nn.Conv2d(64, 64, kernel_size=3, stride=1))
-        self.flatten = nn.Flatten()
-        self.fc = nn.Linear(28224, 512)
+        self.conv1 = nn.Conv2d(c, 4, 3, padding=1)
+        self.conv2 = nn.Conv2d(4, 8, 3, padding=1)
+        self.conv3 = nn.Conv2d(8, 16, 3, padding=1)
+        self.conv4 = nn.Conv2d(16, 16, 3, padding=1)
+        self.conv5 = nn.Conv2d(16, 16, 3, padding=1)
         
-        self.advantage = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, output_dim)
-        )
+        self.pool = nn.MaxPool2d(2, ceil_mode=True)
         
-        self.value = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 1)
-        )
+        self.fcval = nn.Linear(144, 20)
+        self.fcval2 = nn.Linear(20, 1)
+        self.fcadv = nn.Linear(144, 20)
+        self.fcadv2 = nn.Linear(20, output_dim)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.flatten(x)
-        x = self.fc(x)
-        advantage = self.advantage(x)
-        value     = self.value(x)
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = self.pool(F.relu(self.conv3(x)))
+        x = self.pool(F.relu(self.conv4(x)))
+        x = self.pool(F.relu(self.conv5(x)))
+
+        x = x.reshape(x.shape[0], -1)
+        
+        advantage = F.relu(self.fcadv(x))
+        advantage = self.fcadv2(advantage)
+        advantage = advantage - torch.mean(advantage, dim=-1, keepdim=True)
+        
+        value = F.relu(self.fcval(x))
+        value = self.fcval2(value)
         return value, advantage
 
 # Agent
