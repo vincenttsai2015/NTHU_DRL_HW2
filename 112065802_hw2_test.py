@@ -19,60 +19,6 @@ from nes_py.wrappers import JoypadSpace
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 
-# Duel DQN Architecture
-class DuelDQN(nn.Module):
-    def __init__(self, observation_shape, n_actions):
-        super().__init__()
-        # CNN
-        self.conv1 = nn.Conv2d(observation_shape[0], 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        # CNN -> FC
-        fc_input_dims = self.calculate_conv_output_dims(observation_shape)
-        # FC
-        self.fc1 = nn.Linear(fc_input_dims, 512)
-        # DUELING
-        self.V = nn.Linear(512, 1)
-        self.A = nn.Linear(512, n_actions)
-    
-    def forward(self, state):
-        t = F.relu(self.conv1(state))
-        t = F.relu(self.conv2(t))
-        t = F.relu(self.conv3(t))
-        t = F.relu(self.fc1(t.reshape(t.shape[0], -1)))
-        V = self.V(t)
-        A = self.A(t)
-        return V,A
-
-    def calculate_conv_output_dims(self, observation_shape):
-        dims = T.zeros((1, *observation_shape))
-        dims = self.conv1(dims)
-        dims = self.conv2(dims)
-        dims = self.conv3(dims)
-        return int(np.prod(dims.shape))
-
-# Dueling Double DQN Architecture
-class D3QN(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        c, h, w = input_dim
-
-        if h != 84:
-            raise ValueError(f"Expecting input height: 84, got: {h}")
-        if w != 84:
-            raise ValueError(f"Expecting input width: 84, got: {w}")
-        
-        self.online = self.DuelDQN(c, output_dim)
-
-        self.target = self.DuelDQN(c, output_dim)
-        self.target.load_state_dict(self.online.state_dict())
-        
-    def forward(self, input, model):
-        if model == "online":
-            return self.online(input)
-        elif model == "target":
-            return self.target(input)
-
 # Agent
 class Agent:
     def __init__(self):     
