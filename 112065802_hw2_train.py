@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torchvision import transforms as T
 import numpy as np
 import matplotlib.pyplot as plt
@@ -71,10 +72,8 @@ class ResizeObservation(gym.ObservationWrapper):
         observation = transforms(observation).squeeze(0)
         return observation
 
-# DQN Architecture
-class D2QN(nn.Module):
-    """mini CNN structure: input -> (conv2d + relu) x 3 -> flatten -> (dense + relu) x 2 -> output"""
-
+# Dueling Double DQN Architecture
+class D3QN(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
         c, h, w = input_dim
@@ -83,35 +82,34 @@ class D2QN(nn.Module):
             raise ValueError(f"Expecting input height: 84, got: {h}")
         if w != 84:
             raise ValueError(f"Expecting input width: 84, got: {w}")
-
-        self.online = self.__build_cnn(c, output_dim)
-
-        self.target = self.__build_cnn(c, output_dim)
-        self.target.load_state_dict(self.online.state_dict())
-
-        # Q_target parameters are frozen.
-        for p in self.target.parameters():
-            p.requires_grad = False
-
-    def forward(self, input, model):
-        if model == "online":
-            return self.online(input)
-        elif model == "target":
-            return self.target(input)
-
-    def __build_cnn(self, c, output_dim):
-        return nn.Sequential(
-            nn.Conv2d(in_channels=c, out_channels=32, kernel_size=8, stride=4),
+        
+        self.conv1 = nn.ReLU(nn.Conv2d(c, 32, kernel_size=8, stride=4))
+        self.conv2 = nn.ReLU(nn.Conv2d(32, 64, kernel_size=4, stride=2))
+        self.conv3 = nn.ReLU(nn.Conv2d(64, 64, kernel_size=3, stride=1))
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(28224, 512)
+        
+        self.advantage = nn.Sequential(
+            nn.Linear(512, 512),
             nn.ReLU(),
-            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(3136, 512),
-            nn.ReLU(),
-            nn.Linear(512, output_dim),
+            nn.Linear(512, output_dim)
         )
+        
+        self.value = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1)
+        )
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.flatten(x)
+        x = self.fc(x)
+        advantage = self.advantage(x)
+        value     = self.value(x)
+        return value, advantage
 
 # Agent
 class Agent:
@@ -122,9 +120,11 @@ class Agent:
         self.use_cuda = torch.cuda.is_available()
         
         # Mario's DNN to predict the most optimal action - we implement this in the Learn section
-        self.net = D2QN(self.state_dim, self.action_dim).float()
+        self.online_net = D3QN(self.state_dim, self.action_dim).float()
+        self.target_net = D3QN(self.state_dim, self.action_dim).float()
         if self.use_cuda:
-            self.net = self.net.to(device='cuda')
+            self.online_net = self.online_net.to(device='cuda')
+            self.target_net = self.target_net.to(device='cuda')
 
         self.exploration_rate = 1
         self.exploration_rate_decay = 0.95
@@ -137,7 +137,7 @@ class Agent:
         
         self.gamma = 0.9
         
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.00025)
+        self.optimizer = torch.optim.Adam(self.online_net.parameters(), lr=0.00025)
         self.loss_fn = torch.nn.SmoothL1Loss()
         
         self.burnin = 1e4  # min. experiences before training
@@ -154,7 +154,7 @@ class Agent:
         else:
             state = state[0].__array__() if isinstance(state, tuple) else state.__array__()
             state = torch.tensor(state).cuda().unsqueeze(0) if self.use_cuda else torch.tensor(state).unsqueeze(0)
-            action_values = self.net(state, model="online")
+            _, action_values = self.online_net(state)
             action_idx = torch.argmax(action_values, axis=1).item()
 
         # decrease exploration_rate
@@ -188,15 +188,19 @@ class Agent:
         return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
 
     def td_estimate(self, state, action):
-        current_Q = self.net(state, model="online")[np.arange(0, self.batch_size), action]  # Q_online(s,a)
-        return current_Q
+        current_V, current_A = self.online_net(state)
+        current_Q = current_V + (current_A - current_A.mean(dim=1, keepdim=True)) # q - batch_size * n_actions
+        return current_Q[np.arange(0, self.batch_size), action]  # Q_online(s,a)
 
     @torch.no_grad()
     def td_target(self, reward, next_state, done):
-        next_state_Q = self.net(next_state, model="online")
-        best_action = torch.argmax(next_state_Q, axis=1)
-        next_Q = self.net(next_state, model="target")[np.arange(0, self.batch_size), best_action]
-        return (reward + (1 - done.float()) * self.gamma * next_Q).float()
+        next_state_V1, next_state_A1 = self.online_net(next_state)
+        next_state_V2, next_state_A2 = self.target_net(next_state)
+        next_state_Q1 = next_state_V1 + (next_state_A1 - next_state_A1.mean(dim=1, keepdim=True))
+        next_state_Q2 = next_state_V2 + (next_state_A2 - next_state_A2.mean(dim=1, keepdim=True))
+        best_action = torch.argmax(next_state_Q1, axis=1)
+        next_Q2 = next_state_Q2[np.arange(0, self.batch_size), best_action]
+        return (reward + (1 - done.float()) * self.gamma * next_Q2).float()
     
     def update_Q_online(self, td_estimate, td_target):
         loss = self.loss_fn(td_estimate, td_target)
@@ -206,7 +210,7 @@ class Agent:
         return loss.item()
 
     def sync_Q_target(self):
-        self.net.target.load_state_dict(self.net.online.state_dict())
+        self.target_net.load_state_dict(self.online_net.state_dict())
     
     def learn(self):
         """Update online action value (Q) function with a batch of experiences"""
@@ -238,8 +242,8 @@ class Agent:
 
     def save_model(self):
         save_path = '112065802_hw2_data'
-        torch.save(self.net.online, save_path)
-        print(f"D2QN model saved to {save_path} at step {self.curr_step}")
+        torch.save(self.online_net.state_dict(), save_path)
+        print(f"D3QN model saved to {save_path} at step {self.curr_step}")
 
 class MetricLogger:
     def __init__(self, save_dir):
